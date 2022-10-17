@@ -44,7 +44,7 @@
 //! ```
 use crate::execution_payload::{
     is_optimistic_candidate_block, validate_execution_payload_for_gossip, validate_merge_block,
-    PayloadNotifier,
+    AllowOptimisticImport, PayloadNotifier,
 };
 use crate::snapshot_cache::PreProcessingSnapshot;
 use crate::validator_monitor::HISTORIC_EPOCHS as VALIDATOR_MONITOR_HISTORIC_EPOCHS;
@@ -349,13 +349,27 @@ impl ExecutionPayloadError {
         // always forced to consider here whether or not to penalize a peer when
         // we add a new error condition.
         match self {
+            // The peer has nothing to do with this error, do not penalize them.
             ExecutionPayloadError::NoExecutionConnection => false,
+            // The peer has nothing to do with this error, do not penalize them.
             ExecutionPayloadError::RequestFailed(_) => false,
-            ExecutionPayloadError::RejectedByExecutionEngine { .. } => true,
+            // An honest optimistic node may propagate blocks which are rejected by an EE, do not
+            // penalize them.
+            ExecutionPayloadError::RejectedByExecutionEngine { .. } => false,
+            // This is a trivial gossip validation condition, there is no reason for an honest peer
+            // to propagate a block with an invalid payload time stamp.
             ExecutionPayloadError::InvalidPayloadTimestamp { .. } => true,
-            ExecutionPayloadError::InvalidTerminalPoWBlock { .. } => true,
-            ExecutionPayloadError::InvalidActivationEpoch { .. } => true,
-            ExecutionPayloadError::InvalidTerminalBlockHash { .. } => true,
+            // An honest optimistic node may propagate blocks with an invalid terminal PoW block, we
+            // should not penalized them.
+            ExecutionPayloadError::InvalidTerminalPoWBlock { .. } => false,
+            // This condition is checked *after* gossip propagation, therefore penalizing gossip
+            // peers for this block would be unfair. There may be an argument to penalize RPC
+            // blocks, since even an optimistic node shouldn't verify this block. We will remove the
+            // penalties for all block imports to keep things simple.
+            ExecutionPayloadError::InvalidActivationEpoch { .. } => false,
+            // As per `Self::InvalidActivationEpoch`.
+            ExecutionPayloadError::InvalidTerminalBlockHash { .. } => false,
+            // Do not penalize the peer since it's not their fault that *we're* optimistic.
             ExecutionPayloadError::UnverifiedNonOptimisticCandidate => false,
         }
     }
@@ -504,8 +518,8 @@ fn process_block_slash_info<T: BeaconChainTypes>(
 ///
 /// ## Errors
 ///
-/// The given `chain_segment` must span no more than two epochs, otherwise an error will be
-/// returned.
+/// The given `chain_segment` must contain only blocks from the same epoch, otherwise an error
+/// will be returned.
 pub fn signature_verify_chain_segment<T: BeaconChainTypes>(
     mut chain_segment: Vec<(Hash256, Arc<SignedBeaconBlock<T::EthSpec>>)>,
     chain: &BeaconChain<T>,
@@ -515,7 +529,7 @@ pub fn signature_verify_chain_segment<T: BeaconChainTypes>(
     }
 
     let (first_root, first_block) = chain_segment.remove(0);
-    let (mut parent, first_block) = load_parent(first_block, chain)?;
+    let (mut parent, first_block) = load_parent(first_root, first_block, chain)?;
     let slot = first_block.slot();
     chain_segment.insert(0, (first_root, first_block));
 
@@ -608,9 +622,10 @@ pub struct ExecutionPendingBlock<T: BeaconChainTypes> {
 pub trait IntoExecutionPendingBlock<T: BeaconChainTypes>: Sized {
     fn into_execution_pending_block(
         self,
+        block_root: Hash256,
         chain: &Arc<BeaconChain<T>>,
     ) -> Result<ExecutionPendingBlock<T>, BlockError<T::EthSpec>> {
-        self.into_execution_pending_block_slashable(chain)
+        self.into_execution_pending_block_slashable(block_root, chain)
             .map(|execution_pending| {
                 // Supply valid block to slasher.
                 if let Some(slasher) = chain.slasher.as_ref() {
@@ -624,6 +639,7 @@ pub trait IntoExecutionPendingBlock<T: BeaconChainTypes>: Sized {
     /// Convert the block to fully-verified form while producing data to aid checking slashability.
     fn into_execution_pending_block_slashable(
         self,
+        block_root: Hash256,
         chain: &Arc<BeaconChain<T>>,
     ) -> Result<ExecutionPendingBlock<T>, BlockSlashInfo<BlockError<T::EthSpec>>>;
 
@@ -767,7 +783,7 @@ impl<T: BeaconChainTypes> GossipVerifiedBlock<T> {
         } else {
             // The proposer index was *not* cached and we must load the parent in order to determine
             // the proposer index.
-            let (mut parent, block) = load_parent(block, chain)?;
+            let (mut parent, block) = load_parent(block_root, block, chain)?;
 
             debug!(
                 chain.log,
@@ -863,11 +879,12 @@ impl<T: BeaconChainTypes> IntoExecutionPendingBlock<T> for GossipVerifiedBlock<T
     /// Completes verification of the wrapped `block`.
     fn into_execution_pending_block_slashable(
         self,
+        block_root: Hash256,
         chain: &Arc<BeaconChain<T>>,
     ) -> Result<ExecutionPendingBlock<T>, BlockSlashInfo<BlockError<T::EthSpec>>> {
         let execution_pending =
             SignatureVerifiedBlock::from_gossip_verified_block_check_slashable(self, chain)?;
-        execution_pending.into_execution_pending_block_slashable(chain)
+        execution_pending.into_execution_pending_block_slashable(block_root, chain)
     }
 
     fn block(&self) -> &SignedBeaconBlock<T::EthSpec> {
@@ -893,7 +910,7 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
         // Check the anchor slot before loading the parent, to avoid spurious lookups.
         check_block_against_anchor_slot(block.message(), chain)?;
 
-        let (mut parent, block) = load_parent(block, chain)?;
+        let (mut parent, block) = load_parent(block_root, block, chain)?;
 
         // Reject any block that exceeds our limit on skipped slots.
         check_block_skip_slots(chain, parent.beacon_block.slot(), block.message())?;
@@ -941,7 +958,7 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
         let (mut parent, block) = if let Some(parent) = from.parent {
             (parent, from.block)
         } else {
-            load_parent(from.block, chain)?
+            load_parent(from.block_root, from.block, chain)?
         };
 
         let state = cheap_state_advance_to_obtain_committees(
@@ -977,29 +994,29 @@ impl<T: BeaconChainTypes> SignatureVerifiedBlock<T> {
         Self::from_gossip_verified_block(from, chain)
             .map_err(|e| BlockSlashInfo::from_early_error(header, e))
     }
+
+    pub fn block_root(&self) -> Hash256 {
+        self.block_root
+    }
 }
 
 impl<T: BeaconChainTypes> IntoExecutionPendingBlock<T> for SignatureVerifiedBlock<T> {
     /// Completes verification of the wrapped `block`.
     fn into_execution_pending_block_slashable(
         self,
+        block_root: Hash256,
         chain: &Arc<BeaconChain<T>>,
     ) -> Result<ExecutionPendingBlock<T>, BlockSlashInfo<BlockError<T::EthSpec>>> {
         let header = self.block.signed_block_header();
         let (parent, block) = if let Some(parent) = self.parent {
             (parent, self.block)
         } else {
-            load_parent(self.block, chain)
+            load_parent(self.block_root, self.block, chain)
                 .map_err(|e| BlockSlashInfo::SignatureValid(header.clone(), e))?
         };
 
-        ExecutionPendingBlock::from_signature_verified_components(
-            block,
-            self.block_root,
-            parent,
-            chain,
-        )
-        .map_err(|e| BlockSlashInfo::SignatureValid(header, e))
+        ExecutionPendingBlock::from_signature_verified_components(block, block_root, parent, chain)
+            .map_err(|e| BlockSlashInfo::SignatureValid(header, e))
     }
 
     fn block(&self) -> &SignedBeaconBlock<T::EthSpec> {
@@ -1012,14 +1029,15 @@ impl<T: BeaconChainTypes> IntoExecutionPendingBlock<T> for Arc<SignedBeaconBlock
     /// and then using that implementation of `IntoExecutionPendingBlock` to complete verification.
     fn into_execution_pending_block_slashable(
         self,
+        block_root: Hash256,
         chain: &Arc<BeaconChain<T>>,
     ) -> Result<ExecutionPendingBlock<T>, BlockSlashInfo<BlockError<T::EthSpec>>> {
         // Perform an early check to prevent wasting time on irrelevant blocks.
-        let block_root = check_block_relevancy(&self, None, chain)
+        let block_root = check_block_relevancy(&self, block_root, chain)
             .map_err(|e| BlockSlashInfo::SignatureNotChecked(self.signed_block_header(), e))?;
 
         SignatureVerifiedBlock::check_slashable(self, block_root, chain)?
-            .into_execution_pending_block_slashable(chain)
+            .into_execution_pending_block_slashable(block_root, chain)
     }
 
     fn block(&self) -> &SignedBeaconBlock<T::EthSpec> {
@@ -1074,7 +1092,7 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
          *  Perform cursory checks to see if the block is even worth processing.
          */
 
-        check_block_relevancy(&block, Some(block_root), chain)?;
+        check_block_relevancy(&block, block_root, chain)?;
 
         /*
          * Advance the given `parent.beacon_state` to the slot of the given `block`.
@@ -1199,7 +1217,7 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
             // - Doing the check here means we can keep our fork-choice implementation "pure". I.e., no
             //   calls to remote servers.
             if is_valid_merge_transition_block {
-                validate_merge_block(&chain, block.message()).await?;
+                validate_merge_block(&chain, block.message(), AllowOptimisticImport::Yes).await?;
             };
 
             // The specification declares that this should be run *inside* `per_block_processing`,
@@ -1293,8 +1311,14 @@ impl<T: BeaconChainTypes> ExecutionPendingBlock<T> {
          */
         if let Some(ref event_handler) = chain.event_handler {
             if event_handler.has_block_reward_subscribers() {
-                let block_reward =
-                    chain.compute_block_reward(block.message(), block_root, &state, true)?;
+                let mut reward_cache = Default::default();
+                let block_reward = chain.compute_block_reward(
+                    block.message(),
+                    block_root,
+                    &state,
+                    &mut reward_cache,
+                    true,
+                )?;
                 event_handler.register(EventKind::BlockReward(block_reward));
             }
         }
@@ -1416,6 +1440,10 @@ fn check_block_against_finalized_slot<T: BeaconChainTypes>(
     block_root: Hash256,
     chain: &BeaconChain<T>,
 ) -> Result<(), BlockError<T::EthSpec>> {
+    // The finalized checkpoint is being read from fork choice, rather than the cached head.
+    //
+    // Fork choice has the most up-to-date view of finalization and there's no point importing a
+    // block which conflicts with the fork-choice view of finalization.
     let finalized_slot = chain
         .canonical_head
         .cached_head()
@@ -1478,7 +1506,7 @@ pub fn check_block_is_finalized_descendant<T: BeaconChainTypes>(
 /// experienced whilst attempting to verify.
 pub fn check_block_relevancy<T: BeaconChainTypes>(
     signed_block: &SignedBeaconBlock<T::EthSpec>,
-    block_root: Option<Hash256>,
+    block_root: Hash256,
     chain: &BeaconChain<T>,
 ) -> Result<Hash256, BlockError<T::EthSpec>> {
     let block = signed_block.message();
@@ -1501,8 +1529,6 @@ pub fn check_block_relevancy<T: BeaconChainTypes>(
     if block.slot() >= MAXIMUM_BLOCK_SLOT_NUMBER {
         return Err(BlockError::BlockSlotLimitReached);
     }
-
-    let block_root = block_root.unwrap_or_else(|| get_block_root(signed_block));
 
     // Do not process a block from a finalized slot.
     check_block_against_finalized_slot(block, block_root, chain)?;
@@ -1557,6 +1583,7 @@ fn verify_parent_block_is_known<T: BeaconChainTypes>(
 /// whilst attempting the operation.
 #[allow(clippy::type_complexity)]
 fn load_parent<T: BeaconChainTypes>(
+    block_root: Hash256,
     block: Arc<SignedBeaconBlock<T::EthSpec>>,
     chain: &BeaconChain<T>,
 ) -> Result<
@@ -1590,7 +1617,7 @@ fn load_parent<T: BeaconChainTypes>(
         .block_times_cache
         .read()
         .get_block_delays(
-            block.canonical_root(),
+            block_root,
             chain
                 .slot_clock
                 .start_of(block.slot())
@@ -1698,6 +1725,9 @@ fn cheap_state_advance_to_obtain_committees<'a, E: EthSpec>(
     let block_epoch = block_slot.epoch(E::slots_per_epoch());
 
     if state.current_epoch() == block_epoch {
+        // Build both the current and previous epoch caches, as the previous epoch caches are
+        // useful for verifying attestations in blocks from the current epoch.
+        state.build_committee_cache(RelativeEpoch::Previous, spec)?;
         state.build_committee_cache(RelativeEpoch::Current, spec)?;
 
         Ok(Cow::Borrowed(state))
@@ -1715,6 +1745,7 @@ fn cheap_state_advance_to_obtain_committees<'a, E: EthSpec>(
         partial_state_advance(&mut state, state_root_opt, target_slot, spec)
             .map_err(|e| BlockError::BeaconChainError(BeaconChainError::from(e)))?;
 
+        state.build_committee_cache(RelativeEpoch::Previous, spec)?;
         state.build_committee_cache(RelativeEpoch::Current, spec)?;
 
         Ok(Cow::Owned(state))

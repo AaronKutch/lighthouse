@@ -1,4 +1,4 @@
-use beacon_node::ClientConfig as Config;
+use beacon_node::{beacon_chain::CountUnrealizedFull, ClientConfig as Config};
 
 use crate::exec::{CommandLineTestExec, CompletedTest};
 use eth1::Eth1Endpoint;
@@ -11,7 +11,7 @@ use std::process::Command;
 use std::str::FromStr;
 use std::string::ToString;
 use tempfile::TempDir;
-use types::{Address, Checkpoint, Epoch, ExecutionBlockHash, Hash256, MainnetEthSpec};
+use types::{Address, Checkpoint, Epoch, ExecutionBlockHash, ForkName, Hash256, MainnetEthSpec};
 use unused_port::{unused_tcp_port, unused_udp_port};
 
 const DEFAULT_ETH1_ENDPOINT: &str = "http://localhost:8545/";
@@ -130,6 +130,106 @@ fn fork_choice_before_proposal_timeout_zero() {
         .flag("fork-choice-before-proposal-timeout", Some("0"))
         .run_with_zero_port()
         .with_config(|config| assert_eq!(config.chain.fork_choice_before_proposal_timeout_ms, 0));
+}
+
+#[test]
+fn paranoid_block_proposal_default() {
+    CommandLineTest::new()
+        .run_with_zero_port()
+        .with_config(|config| assert!(!config.chain.paranoid_block_proposal));
+}
+
+#[test]
+fn paranoid_block_proposal_on() {
+    CommandLineTest::new()
+        .flag("paranoid-block-proposal", None)
+        .run_with_zero_port()
+        .with_config(|config| assert!(config.chain.paranoid_block_proposal));
+}
+
+#[test]
+fn count_unrealized_default() {
+    CommandLineTest::new()
+        .run_with_zero_port()
+        .with_config(|config| assert!(config.chain.count_unrealized));
+}
+
+#[test]
+fn count_unrealized_no_arg() {
+    CommandLineTest::new()
+        .flag("count-unrealized", None)
+        .run_with_zero_port()
+        .with_config(|config| assert!(config.chain.count_unrealized));
+}
+
+#[test]
+fn count_unrealized_false() {
+    CommandLineTest::new()
+        .flag("count-unrealized", Some("false"))
+        .run_with_zero_port()
+        .with_config(|config| assert!(!config.chain.count_unrealized));
+}
+
+#[test]
+fn count_unrealized_true() {
+    CommandLineTest::new()
+        .flag("count-unrealized", Some("true"))
+        .run_with_zero_port()
+        .with_config(|config| assert!(config.chain.count_unrealized));
+}
+
+#[test]
+fn count_unrealized_full_no_arg() {
+    CommandLineTest::new()
+        .flag("count-unrealized-full", None)
+        .run_with_zero_port()
+        .with_config(|config| {
+            assert_eq!(
+                config.chain.count_unrealized_full,
+                CountUnrealizedFull::False
+            )
+        });
+}
+
+#[test]
+fn count_unrealized_full_false() {
+    CommandLineTest::new()
+        .flag("count-unrealized-full", Some("false"))
+        .run_with_zero_port()
+        .with_config(|config| {
+            assert_eq!(
+                config.chain.count_unrealized_full,
+                CountUnrealizedFull::False
+            )
+        });
+}
+
+#[test]
+fn count_unrealized_full_true() {
+    CommandLineTest::new()
+        .flag("count-unrealized-full", Some("true"))
+        .run_with_zero_port()
+        .with_config(|config| {
+            assert_eq!(
+                config.chain.count_unrealized_full,
+                CountUnrealizedFull::True
+            )
+        });
+}
+
+#[test]
+fn reset_payload_statuses_default() {
+    CommandLineTest::new()
+        .run_with_zero_port()
+        .with_config(|config| assert!(!config.chain.always_reset_payload_statuses));
+}
+
+#[test]
+fn reset_payload_statuses_present() {
+    CommandLineTest::new()
+        .flag("reset-payload-statuses", None)
+        .run_with_zero_port()
+        .with_config(|config| assert!(config.chain.always_reset_payload_statuses));
 }
 
 #[test]
@@ -394,25 +494,36 @@ fn merge_fee_recipient_flag() {
 fn run_payload_builder_flag_test(flag: &str, builders: &str) {
     use sensitive_url::SensitiveUrl;
 
-    let dir = TempDir::new().expect("Unable to create temporary directory");
     let all_builders: Vec<_> = builders
         .split(",")
         .map(|builder| SensitiveUrl::parse(builder).expect("valid builder url"))
         .collect();
-    CommandLineTest::new()
-        .flag("execution-endpoint", Some("http://meow.cats"))
+    run_payload_builder_flag_test_with_config(flag, builders, None, None, |config| {
+        let config = config.execution_layer.as_ref().unwrap();
+        // Only first provided endpoint is parsed as we don't support
+        // redundancy.
+        assert_eq!(config.builder_url, all_builders.get(0).cloned());
+    })
+}
+fn run_payload_builder_flag_test_with_config<F: Fn(&Config)>(
+    flag: &str,
+    builders: &str,
+    additional_flag: Option<&str>,
+    additional_flag_value: Option<&str>,
+    f: F,
+) {
+    let dir = TempDir::new().expect("Unable to create temporary directory");
+    let mut test = CommandLineTest::new();
+    test.flag("execution-endpoint", Some("http://meow.cats"))
         .flag(
             "execution-jwt",
             dir.path().join("jwt-file").as_os_str().to_str(),
         )
-        .flag(flag, Some(builders))
-        .run_with_zero_port()
-        .with_config(|config| {
-            let config = config.execution_layer.as_ref().unwrap();
-            // Only first provided endpoint is parsed as we don't support
-            // redundancy.
-            assert_eq!(config.builder_url, all_builders.get(0).cloned());
-        });
+        .flag(flag, Some(builders));
+    if let Some(additional_flag_name) = additional_flag {
+        test.flag(additional_flag_name, additional_flag_value);
+    }
+    test.run_with_zero_port().with_config(f);
 }
 
 #[test]
@@ -420,7 +531,78 @@ fn payload_builder_flags() {
     run_payload_builder_flag_test("builder", "http://meow.cats");
     run_payload_builder_flag_test("payload-builder", "http://meow.cats");
     run_payload_builder_flag_test("payload-builders", "http://meow.cats,http://woof.dogs");
-    run_payload_builder_flag_test("payload-builders", "http://meow.cats,http://woof.dogs");
+}
+
+#[test]
+fn builder_fallback_flags() {
+    run_payload_builder_flag_test_with_config(
+        "builder",
+        "http://meow.cats",
+        Some("builder-fallback-skips"),
+        Some("7"),
+        |config| {
+            assert_eq!(config.chain.builder_fallback_skips, 7);
+        },
+    );
+    run_payload_builder_flag_test_with_config(
+        "builder",
+        "http://meow.cats",
+        Some("builder-fallback-skips-per-epoch"),
+        Some("11"),
+        |config| {
+            assert_eq!(config.chain.builder_fallback_skips_per_epoch, 11);
+        },
+    );
+    run_payload_builder_flag_test_with_config(
+        "builder",
+        "http://meow.cats",
+        Some("builder-fallback-epochs-since-finalization"),
+        Some("4"),
+        |config| {
+            assert_eq!(config.chain.builder_fallback_epochs_since_finalization, 4);
+        },
+    );
+    run_payload_builder_flag_test_with_config(
+        "builder",
+        "http://meow.cats",
+        Some("builder-fallback-disable-checks"),
+        None,
+        |config| {
+            assert_eq!(config.chain.builder_fallback_disable_checks, true);
+        },
+    );
+    run_payload_builder_flag_test_with_config(
+        "builder",
+        "http://meow.cats",
+        Some("builder-profit-threshold"),
+        Some("1000000000000000000000000"),
+        |config| {
+            assert_eq!(
+                config
+                    .execution_layer
+                    .as_ref()
+                    .unwrap()
+                    .builder_profit_threshold,
+                1000000000000000000000000
+            );
+        },
+    );
+    run_payload_builder_flag_test_with_config(
+        "builder",
+        "http://meow.cats",
+        None,
+        None,
+        |config| {
+            assert_eq!(
+                config
+                    .execution_layer
+                    .as_ref()
+                    .unwrap()
+                    .builder_profit_threshold,
+                0
+            );
+        },
+    );
 }
 
 fn run_jwt_optional_flags_test(jwt_flag: &str, jwt_id_flag: &str, jwt_version_flag: &str) {
@@ -868,6 +1050,21 @@ fn http_tls_flags() {
         });
 }
 
+#[test]
+fn http_spec_fork_default() {
+    CommandLineTest::new()
+        .run_with_zero_port()
+        .with_config(|config| assert_eq!(config.http_api.spec_fork_name, None));
+}
+
+#[test]
+fn http_spec_fork_override() {
+    CommandLineTest::new()
+        .flag("http-spec-fork", Some("altair"))
+        .run_with_zero_port()
+        .with_config(|config| assert_eq!(config.http_api.spec_fork_name, Some(ForkName::Altair)));
+}
+
 // Tests for Metrics flags.
 #[test]
 fn metrics_flag() {
@@ -1028,6 +1225,19 @@ fn compact_db_flag() {
         .flag("compact-db", None)
         .run_with_zero_port()
         .with_config(|config| assert!(config.store.compact_on_init));
+}
+#[test]
+fn prune_payloads_default() {
+    CommandLineTest::new()
+        .run_with_zero_port()
+        .with_config(|config| assert!(config.store.prune_payloads));
+}
+#[test]
+fn prune_payloads_on_startup_false() {
+    CommandLineTest::new()
+        .flag("prune-payloads", Some("false"))
+        .run_with_zero_port()
+        .with_config(|config| assert!(!config.store.prune_payloads));
 }
 #[test]
 fn reconstruct_historic_states_flag() {
@@ -1192,8 +1402,34 @@ fn slasher_broadcast_flag() {
             assert!(slasher_config.broadcast);
         });
 }
+
 #[test]
-pub fn malloc_tuning_flag() {
+fn slasher_backend_default() {
+    CommandLineTest::new()
+        .flag("slasher", None)
+        .run_with_zero_port()
+        .with_config(|config| {
+            let slasher_config = config.slasher.as_ref().unwrap();
+            assert_eq!(slasher_config.backend, slasher::DatabaseBackend::Mdbx);
+        });
+}
+
+#[test]
+fn slasher_backend_override_to_default() {
+    // Hard to test this flag because all but one backend is disabled by default and the backend
+    // called "disabled" results in a panic.
+    CommandLineTest::new()
+        .flag("slasher", None)
+        .flag("slasher-backend", Some("mdbx"))
+        .run_with_zero_port()
+        .with_config(|config| {
+            let slasher_config = config.slasher.as_ref().unwrap();
+            assert_eq!(slasher_config.backend, slasher::DatabaseBackend::Mdbx);
+        });
+}
+
+#[test]
+fn malloc_tuning_flag() {
     CommandLineTest::new()
         .flag("disable-malloc-tuning", None)
         .run_with_zero_port()
@@ -1214,5 +1450,18 @@ fn ensure_panic_on_failed_launch() {
                 .as_ref()
                 .expect("Unable to parse Slasher config");
             assert_eq!(slasher_config.chunk_size, 10);
+        });
+}
+
+#[test]
+fn monitoring_endpoint() {
+    CommandLineTest::new()
+        .flag("monitoring-endpoint", Some("http://example:8000"))
+        .flag("monitoring-endpoint-period", Some("30"))
+        .run_with_zero_port()
+        .with_config(|config| {
+            let api_conf = config.monitoring_api.as_ref().unwrap();
+            assert_eq!(api_conf.monitoring_endpoint.as_str(), "http://example:8000");
+            assert_eq!(api_conf.update_period_secs, Some(30));
         });
 }

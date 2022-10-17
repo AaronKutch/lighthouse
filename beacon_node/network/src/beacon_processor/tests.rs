@@ -221,7 +221,7 @@ impl TestRig {
     }
 
     pub async fn recompute_head(&self) {
-        self.chain.recompute_head_at_current_slot().await.unwrap()
+        self.chain.recompute_head_at_current_slot().await
     }
 
     pub fn head_root(&self) -> Hash256 {
@@ -242,6 +242,7 @@ impl TestRig {
 
     pub fn enqueue_rpc_block(&self) {
         let event = WorkEvent::rpc_beacon_block(
+            self.next_block.canonical_root(),
             self.next_block.clone(),
             std::time::Duration::default(),
             BlockProcessType::ParentLookup {
@@ -253,6 +254,7 @@ impl TestRig {
 
     pub fn enqueue_single_lookup_rpc_block(&self) {
         let event = WorkEvent::rpc_beacon_block(
+            self.next_block.canonical_root(),
             self.next_block.clone(),
             std::time::Duration::default(),
             BlockProcessType::SingleBlock { id: 1 },

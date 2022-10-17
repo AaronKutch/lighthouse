@@ -3,7 +3,9 @@ use crate::execution_engine::{
 };
 use crate::transactions::transactions;
 use ethers_providers::Middleware;
-use execution_layer::{ExecutionLayer, PayloadAttributes, PayloadStatus};
+use execution_layer::{
+    BuilderParams, ChainHealth, ExecutionLayer, PayloadAttributes, PayloadStatus,
+};
 use fork_choice::ForkchoiceUpdateParameters;
 use reqwest::{header::CONTENT_TYPE, Client};
 use sensitive_url::SensitiveUrl;
@@ -14,7 +16,7 @@ use task_executor::TaskExecutor;
 use tokio::time::sleep;
 use types::{
     Address, ChainSpec, EthSpec, ExecutionBlockHash, ExecutionPayload, FullPayload, Hash256,
-    MainnetEthSpec, Slot, Uint256,
+    MainnetEthSpec, PublicKeyBytes, Slot, Uint256,
 };
 const EXECUTION_ENGINE_START_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -237,13 +239,16 @@ impl<E: GenericExecutionEngine> TestRig<E> {
 
         // Submit transactions before getting payload
         let txs = transactions::<MainnetEthSpec>(account1, account2);
+        let mut pending_txs = Vec::new();
         for tx in txs.clone().into_iter() {
-            self.ee_a
+            let pending_tx = self
+                .ee_a
                 .execution_engine
                 .provider
                 .send_transaction(tx, None)
                 .await
                 .unwrap();
+            pending_txs.push(pending_tx);
         }
 
         /*
@@ -305,6 +310,11 @@ impl<E: GenericExecutionEngine> TestRig<E> {
         // in CI.
         sleep(Duration::from_secs(3)).await;
 
+        let builder_params = BuilderParams {
+            pubkey: PublicKeyBytes::empty(),
+            slot: Slot::new(0),
+            chain_health: ChainHealth::Healthy,
+        };
         let valid_payload = self
             .ee_a
             .execution_layer
@@ -313,15 +323,13 @@ impl<E: GenericExecutionEngine> TestRig<E> {
                 timestamp,
                 prev_randao,
                 proposer_index,
-                None,
-                Slot::new(0),
                 forkchoice_update_params,
+                builder_params,
+                &self.spec,
             )
             .await
             .unwrap()
             .execution_payload;
-
-        assert_eq!(valid_payload.transactions.len(), txs.len());
 
         /*
          * Execution Engine A:
@@ -386,6 +394,18 @@ impl<E: GenericExecutionEngine> TestRig<E> {
             .await
             .unwrap();
         assert_eq!(status, PayloadStatus::Valid);
+        assert_eq!(valid_payload.transactions.len(), pending_txs.len());
+
+        // Verify that all submitted txs were successful
+        for pending_tx in pending_txs {
+            let tx_receipt = pending_tx.await.unwrap().unwrap();
+            assert_eq!(
+                tx_receipt.status,
+                Some(1.into()),
+                "Tx index {} has invalid status ",
+                tx_receipt.transaction_index
+            );
+        }
 
         /*
          * Execution Engine A:
@@ -413,6 +433,11 @@ impl<E: GenericExecutionEngine> TestRig<E> {
         let timestamp = valid_payload.timestamp + 1;
         let prev_randao = Hash256::zero();
         let proposer_index = 0;
+        let builder_params = BuilderParams {
+            pubkey: PublicKeyBytes::empty(),
+            slot: Slot::new(0),
+            chain_health: ChainHealth::Healthy,
+        };
         let second_payload = self
             .ee_a
             .execution_layer
@@ -421,9 +446,9 @@ impl<E: GenericExecutionEngine> TestRig<E> {
                 timestamp,
                 prev_randao,
                 proposer_index,
-                None,
-                Slot::new(0),
                 forkchoice_update_params,
+                builder_params,
+                &self.spec,
             )
             .await
             .unwrap()
@@ -488,7 +513,11 @@ impl<E: GenericExecutionEngine> TestRig<E> {
             .notify_new_payload(&second_payload)
             .await
             .unwrap();
-        assert_eq!(status, PayloadStatus::Accepted);
+        // TODO: we should remove the `Accepted` status here once Geth fixes it
+        assert!(matches!(
+            status,
+            PayloadStatus::Syncing | PayloadStatus::Accepted
+        ));
 
         /*
          * Execution Engine B:

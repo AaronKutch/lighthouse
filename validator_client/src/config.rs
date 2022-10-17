@@ -52,7 +52,12 @@ pub struct Config {
     /// If true, enable functionality that monitors the network for attestations or proposals from
     /// any of the validators managed by this client before starting up.
     pub enable_doppelganger_protection: bool,
-    pub private_tx_proposals: bool,
+    /// Enable use of the blinded block endpoints during proposals.
+    pub builder_proposals: bool,
+    /// Overrides the timestamp field in builder api ValidatorRegistrationV1
+    pub builder_registration_timestamp_override: Option<u64>,
+    /// Fallback gas limit.
+    pub gas_limit: Option<u64>,
     /// A list of custom certificates that the validator client will additionally use when
     /// connecting to a beacon node over SSL/TLS.
     pub beacon_nodes_tls_certs: Option<Vec<PathBuf>>,
@@ -88,7 +93,9 @@ impl Default for Config {
             monitoring_api: None,
             enable_doppelganger_protection: false,
             beacon_nodes_tls_certs: None,
-            private_tx_proposals: false,
+            builder_proposals: false,
+            builder_registration_timestamp_override: None,
+            gas_limit: None,
         }
     }
 }
@@ -285,9 +292,12 @@ impl Config {
          * Explorer metrics
          */
         if let Some(monitoring_endpoint) = cli_args.value_of("monitoring-endpoint") {
+            let update_period_secs =
+                clap_utils::parse_optional(cli_args, "monitoring-endpoint-period")?;
             config.monitoring_api = Some(monitoring_api::Config {
                 db_path: None,
                 freezer_db_path: None,
+                update_period_secs,
                 monitoring_endpoint: monitoring_endpoint.to_string(),
             });
         }
@@ -296,8 +306,35 @@ impl Config {
             config.enable_doppelganger_protection = true;
         }
 
-        if cli_args.is_present("private-tx-proposals") {
-            config.private_tx_proposals = true;
+        if cli_args.is_present("builder-proposals") {
+            config.builder_proposals = true;
+        }
+
+        config.gas_limit = cli_args
+            .value_of("gas-limit")
+            .map(|gas_limit| {
+                gas_limit
+                    .parse::<u64>()
+                    .map_err(|_| "gas-limit is not a valid u64.")
+            })
+            .transpose()?;
+
+        if let Some(registration_timestamp_override) =
+            cli_args.value_of("builder-registration-timestamp-override")
+        {
+            config.builder_registration_timestamp_override = Some(
+                registration_timestamp_override
+                    .parse::<u64>()
+                    .map_err(|_| "builder-registration-timestamp-override is not a valid u64.")?,
+            );
+        }
+
+        if cli_args.is_present("strict-fee-recipient") {
+            warn!(
+                log,
+                "The flag `--strict-fee-recipient` has been deprecated due to a bug causing \
+                missed proposals. The flag will be ignored."
+            );
         }
 
         Ok(config)

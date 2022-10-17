@@ -116,7 +116,14 @@ pub fn get_config<E: EthSpec>(
     }
 
     if cli_args.is_present("http-disable-legacy-spec") {
-        client_config.http_api.serve_legacy_spec = false;
+        warn!(
+            log,
+            "The flag --http-disable-legacy-spec is deprecated and will be removed"
+        );
+    }
+
+    if let Some(fork_name) = clap_utils::parse_optional(cli_args, "http-spec-fork")? {
+        client_config.http_api.spec_fork_name = Some(fork_name);
     }
 
     if cli_args.is_present("http-enable-tls") {
@@ -171,9 +178,13 @@ pub fn get_config<E: EthSpec>(
      * Explorer metrics
      */
     if let Some(monitoring_endpoint) = cli_args.value_of("monitoring-endpoint") {
+        let update_period_secs =
+            clap_utils::parse_optional(cli_args, "monitoring-endpoint-period")?;
+
         client_config.monitoring_api = Some(monitoring_api::Config {
             db_path: None,
             freezer_db_path: None,
+            update_period_secs,
             monitoring_endpoint: monitoring_endpoint.to_string(),
         });
     }
@@ -302,6 +313,8 @@ pub fn get_config<E: EthSpec>(
         el_config.jwt_id = clap_utils::parse_optional(cli_args, "execution-jwt-id")?;
         el_config.jwt_version = clap_utils::parse_optional(cli_args, "execution-jwt-version")?;
         el_config.default_datadir = client_config.data_dir.clone();
+        el_config.builder_profit_threshold =
+            clap_utils::parse_required(cli_args, "builder-profit-threshold")?;
 
         // If `--execution-endpoint` is provided, we should ignore any `--eth1-endpoints` values and
         // use `--execution-endpoint` instead. Also, log a deprecation warning.
@@ -343,6 +356,10 @@ pub fn get_config<E: EthSpec>(
         client_config.store.compact_on_prune = compact_on_prune
             .parse()
             .map_err(|_| "auto-compact-db takes a boolean".to_string())?;
+    }
+
+    if let Some(prune_payloads) = clap_utils::parse_optional(cli_args, "prune-payloads")? {
+        client_config.store.prune_payloads = prune_payloads;
     }
 
     /*
@@ -584,6 +601,10 @@ pub fn get_config<E: EthSpec>(
 
         slasher_config.broadcast = cli_args.is_present("slasher-broadcast");
 
+        if let Some(backend) = clap_utils::parse_optional(cli_args, "slasher-backend")? {
+            slasher_config.backend = backend;
+        }
+
         client_config.slasher = Some(slasher_config);
     }
 
@@ -629,6 +650,30 @@ pub fn get_config<E: EthSpec>(
     {
         client_config.chain.fork_choice_before_proposal_timeout_ms = timeout;
     }
+
+    client_config.chain.count_unrealized =
+        clap_utils::parse_required(cli_args, "count-unrealized")?;
+    client_config.chain.count_unrealized_full =
+        clap_utils::parse_required::<bool>(cli_args, "count-unrealized-full")?.into();
+
+    client_config.chain.always_reset_payload_statuses =
+        cli_args.is_present("reset-payload-statuses");
+
+    client_config.chain.paranoid_block_proposal = cli_args.is_present("paranoid-block-proposal");
+
+    /*
+     * Builder fallback configs.
+     */
+    client_config.chain.builder_fallback_skips =
+        clap_utils::parse_required(cli_args, "builder-fallback-skips")?;
+    client_config.chain.builder_fallback_skips_per_epoch =
+        clap_utils::parse_required(cli_args, "builder-fallback-skips-per-epoch")?;
+    client_config
+        .chain
+        .builder_fallback_epochs_since_finalization =
+        clap_utils::parse_required(cli_args, "builder-fallback-epochs-since-finalization")?;
+    client_config.chain.builder_fallback_disable_checks =
+        cli_args.is_present("builder-fallback-disable-checks");
 
     Ok(client_config)
 }
